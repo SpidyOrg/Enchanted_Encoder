@@ -9,9 +9,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from pytdbot import types
+from pyrogram.types import Message
 
+from telegram_bot.downloader import TDLibDownloader
 from telegram_bot.encoder import (
     STALL_TIMEOUT,
     encode_h264_720p,
@@ -20,31 +22,37 @@ from telegram_bot.encoder import (
 )
 from telegram_bot.runtime import format_duration, has_free_space, status_footer
 from telegram_bot.settings import EncodeProfile
-from telegram_bot.transfer import ProgressMessage, UploadProgress, safe_edit_text, upload_document, upload_video
+from telegram_bot.transfer import (
+    ProgressMessage,
+    safe_edit_text,
+    upload_document,
+    upload_video,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 DISK_HEADROOM_MULTIPLIER = 2.5
 MAX_STATUS_QUEUE_ITEMS = 10
 MAX_STATUS_LENGTH = 3950
-MAX_CONCURRENT_DOWNLOADS = 1
 AUTO_DELETE_STATUS_DELAY = 30
 
 
 @dataclass
 class VideoJob:
     id: int
-    message: types.Message
-    status: types.Message
-    source_path: Path
+    message: Message
+    status: Message
     profile: EncodeProfile
     queued_at: float
-    source_message_id: int
     owner_id: str
     owner_label: str
     filename: str
+    file_size: int
+    source_message_id: int
+    chat_id: int
     state: str = "queued"
     started_at: float | None = None
+    source_path: Path | None = None
     reserved_space: int = 0
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     send_as_document: bool = False
@@ -53,16 +61,16 @@ class VideoJob:
 class EncodeQueue:
     def __init__(
         self,
-        upload_progress: UploadProgress,
         output_dir: Path = Path("encoded"),
+        downloader: TDLibDownloader | None = None,
         max_size: int = 20,
         max_jobs_per_user: int = 3,
         max_concurrent_encoders: int = 2,
         journal_path: Path | None = None,
     ) -> None:
         self._queue: asyncio.Queue[VideoJob] = asyncio.Queue(maxsize=max_size)
-        self._upload_progress = upload_progress
         self._output_dir = output_dir
+        self._downloader = downloader
         self._max_jobs_per_user = max_jobs_per_user
         self._max_concurrent_encoders = max_concurrent_encoders
         self._encode_threads = max(1, math.ceil((os.cpu_count() or 1) / max_concurrent_encoders))
@@ -71,11 +79,18 @@ class EncodeQueue:
         self._reserved_encode_space = 0
         self._next_id = 1
         self._user_jobs: dict[str, int] = {}
-        self._user_downloads: dict[str, int] = {}
-        self._user_status: dict[str, types.Message] = {}
+        self._user_status: dict[str, Message] = {}
         self._user_status_locks: dict[str, asyncio.Lock] = {}
         self._journal_path = journal_path
         self._load_journal()
+
+    @property
+    def encode_threads(self) -> int:
+        return self._encode_threads
+
+    @property
+    def max_jobs_per_user(self) -> int:
+        return self._max_jobs_per_user
 
     @property
     def active(self) -> bool:
@@ -89,23 +104,8 @@ class EncodeQueue:
     def capacity(self) -> int:
         return self._queue.maxsize
 
-    @property
-    def concurrency(self) -> int:
-        return self._max_concurrent_encoders
-
-    def reserve_download(self, user_id: str) -> bool:
-        count = self._user_downloads.get(user_id, 0)
-        if count >= MAX_CONCURRENT_DOWNLOADS:
-            return False
-        self._user_downloads[user_id] = count + 1
-        return True
-
-    def release_download(self, user_id: str) -> None:
-        count = self._user_downloads.get(user_id, 0)
-        if count <= 1:
-            self._user_downloads.pop(user_id, None)
-        else:
-            self._user_downloads[user_id] = count - 1
+    def user_job_count(self, user_id: str) -> int:
+        return self._user_jobs.get(user_id, 0)
 
     def reserve_user_slot(self, user_id: str) -> bool:
         count = self._user_jobs.get(user_id, 0)
@@ -129,7 +129,7 @@ class EncodeQueue:
             lines.append("")
             for j in active:
                 elapsed = format_duration(time.time() - (j.started_at or time.time()))
-                icon = "📤" if j.state == "uploading" else "🎬"
+                icon = "📤" if j.state == "uploading" else ("📥" if j.state == "downloading" else "🎬")
                 lines.append(f"{icon} #{j.id} {j.state.title()}: {_short(j.filename)} [{elapsed}]")
         if queued:
             lines.append("")
@@ -152,27 +152,28 @@ class EncodeQueue:
         for j in queued:
             entries.append({
                 "id": j.id,
-                "source_path": str(j.source_path),
                 "profile_key": j.profile.key,
                 "owner_id": j.owner_id,
                 "owner_label": j.owner_label,
                 "filename": j.filename,
+                "file_size": j.file_size,
                 "queued_at": j.queued_at,
                 "source_message_id": j.source_message_id,
+                "chat_id": j.chat_id,
                 "send_as_document": j.send_as_document,
             })
-        # Also save active jobs that haven't started processing yet
         for j in self._active_jobs.values():
-            if j.state in ("queued",):
+            if j.state == "queued":
                 entries.append({
                     "id": j.id,
-                    "source_path": str(j.source_path),
                     "profile_key": j.profile.key,
                     "owner_id": j.owner_id,
                     "owner_label": j.owner_label,
                     "filename": j.filename,
+                    "file_size": j.file_size,
                     "queued_at": j.queued_at,
                     "source_message_id": j.source_message_id,
+                    "chat_id": j.chat_id,
                     "send_as_document": j.send_as_document,
                 })
         try:
@@ -194,22 +195,7 @@ class EncodeQueue:
             if next_id > self._next_id:
                 self._next_id = next_id
             jobs = data.get("jobs", [])
-            orphaned = 0
-            for entry in jobs:
-                src = Path(entry["source_path"])
-                if src.exists():
-                    orphaned += 1
-                    LOGGER.info(
-                        "Orphaned job #%s (%s) found on disk — source file exists but "
-                        "cannot be resumed after restart. File will be cleaned up.",
-                        entry.get("id"), entry.get("filename"),
-                    )
-                else:
-                    orphaned += 1
-                    LOGGER.info(
-                        "Orphaned job #%s (%s) source file missing — discarding.",
-                        entry.get("id"), entry.get("filename"),
-                    )
+            orphaned = len(jobs)
             if orphaned:
                 LOGGER.warning(
                     "Discarded %d orphaned job(s) from queue journal. "
@@ -269,19 +255,19 @@ class EncodeQueue:
             self._queue._queue = deque(item for item in queued if item is not job)
             self._queue.task_done()
             job.cancel_event.set()
-            cleanup_file(job.source_path)
+            cleanup_file(job.source_path) if job.source_path else None
             self.release_user(job.owner_id)
             await self._update_user_status(job.owner_id)
             self._save_journal()
             return f"🗑 Cancelled queued job {job.id}."
         return "No matching task found."
 
-    async def get_or_create_user_status(self, user_id: str, source_message: types.Message) -> types.Message | None:
+    async def get_or_create_user_status(self, user_id: str, source_message: Message) -> Message | None:
         existing = self._user_status.get(user_id)
         if existing is not None:
             return existing
         status = await source_message.reply_text("📋 Preparing your queue..." + status_footer())
-        if getattr(status, "is_error", False):
+        if status is None:
             return None
         self._user_status[user_id] = status
         self._user_status_locks[user_id] = asyncio.Lock()
@@ -311,7 +297,7 @@ class EncodeQueue:
                 lines.append("")
             for j in active:
                 elapsed = format_duration(time.time() - (j.started_at or time.time()))
-                icon = "📤" if j.state == "uploading" else "🎬"
+                icon = "📤" if j.state == "uploading" else ("📥" if j.state == "downloading" else "🎬")
                 lines.append(f"{icon} #{j.id} {j.state.title()}: {_short(j.filename)} [{elapsed}]")
         if queued:
             lines.append("")
@@ -365,65 +351,108 @@ class EncodeQueue:
         while True:
             job = await self._queue.get()
             self._active_jobs[job.id] = job
-            job.state = "encoding"
             job.started_at = time.time()
             encoded_path: Path | None = None
             thumbnail_path: Path | None = None
+            downloaded_path: Path | None = None
             try:
+                # ── Download phase ──
+                job.state = "downloading"
+                await self._update_user_status(
+                    job.owner_id,
+                    f"📥 Downloading: {_short(job.filename)}",
+                )
+                if self._downloader:
+                    dl_progress = ProgressMessage(
+                        job.status, "📥 Downloading", job.file_size,
+                        queue=self, user_id=job.owner_id,
+                    )
+                    async def _dl_callback(current: int, total: int) -> None:
+                        await dl_progress.update(current)
+                    downloaded_path = await self._downloader.download(
+                        chat_id=job.chat_id,
+                        message_id=job.source_message_id,
+                        progress_callback=_dl_callback,
+                        cancel_event=job.cancel_event,
+                    )
+                else:
+                    raise RuntimeError("No downloader configured")
+                job.source_path = downloaded_path
+
+                # ── Encode phase ──
+                job.state = "encoding"
                 await self._update_user_status(job.owner_id)
-                required_space = int(job.source_path.stat().st_size * DISK_HEADROOM_MULTIPLIER)
+                required_space = int(downloaded_path.stat().st_size * DISK_HEADROOM_MULTIPLIER)
                 if not has_free_space(self._output_dir, required_space + self._reserved_encode_space):
                     raise RuntimeError("Insufficient free disk space for concurrent encoding")
-                job.reserved_space = required_space
                 self._reserved_encode_space += required_space
+                job.reserved_space = required_space
+
                 encode_progress = ProgressMessage(
                     job.status, "🎬 Encoding", 0,
                     extra=f"🆔 Job: {job.id}\n🎛 Profile: {job.profile.label}\n",
                     queue=self, user_id=job.owner_id,
                 )
                 encoded_path = await encode_h264_720p(
-                    job.source_path, self._output_dir, encode_progress,
+                    downloaded_path, self._output_dir, encode_progress,
                     profile=job.profile, cancel_event=job.cancel_event, job_id=job.id,
                     queue=self, user_id=job.owner_id,
                     encode_threads=self._encode_threads,
                 )
                 metadata = await probe_video_metadata(encoded_path)
                 thumbnail_path = await make_thumbnail(encoded_path, self._output_dir, metadata.duration)
+
+                # ── Upload phase ──
                 job.state = "uploading"
                 await self._update_user_status(job.owner_id)
-                upload_progress = ProgressMessage(
+                up_progress = ProgressMessage(
                     job.status, "📤 Uploading", encoded_path.stat().st_size,
                     extra=f"🆔 Job: {job.id}\n🎛 Profile: {job.profile.label}\n",
                     queue=self, user_id=job.owner_id,
                 )
+                async def _up_callback(current: int, total: int) -> None:
+                    if job.cancel_event.is_set():
+                        raise asyncio.CancelledError("Upload cancelled")
+                    await up_progress.update(current)
+
                 if job.send_as_document:
                     await upload_document(
-                        job.message, encoded_path, self._upload_progress, upload_progress,
+                        job.message, encoded_path, progress_callback=_up_callback,
                     )
                 else:
                     await upload_video(
-                        job.message, encoded_path, self._upload_progress, upload_progress,
+                        job.message, encoded_path, progress_callback=_up_callback,
                         cancel_event=job.cancel_event, thumbnail=thumbnail_path,
-                        duration=int(metadata.duration), width=metadata.width, height=metadata.height,
+                        duration=int(metadata.duration), width=metadata.width,
+                        height=metadata.height,
                         caption=f"Encoded with {job.profile.name}: {job.profile.codec.upper()} {job.profile.resolution}p CRF {job.profile.crf}.",
                     )
-                await job.message.reply_text(
-                    f"✅ Done: {job.filename}\n"
-                    f"Job #{job.id} | {job.profile.label}"
-                    f"{status_footer()}",
-                )
+
+                # Done notification
+                try:
+                    await job.message.reply_text(
+                        f"✅ Done: {job.filename}\n"
+                        f"Job #{job.id} | {job.profile.label}"
+                        f"{status_footer()}",
+                    )
+                except Exception:
+                    pass
+
             except asyncio.CancelledError:
                 await self._update_user_status(job.owner_id)
                 if not job.cancel_event.is_set():
                     raise
             except Exception as exc:
-                LOGGER.exception("Queued media transfer failed")
-                await self._update_user_status(job.owner_id)
+                LOGGER.exception("Queued job failed")
+                await self._update_user_status(
+                    job.owner_id, f"❌ {friendly_error(exc)}",
+                )
             finally:
-                cleanup_file(job.source_path)
-                if encoded_path is not None:
+                if downloaded_path:
+                    cleanup_file(downloaded_path)
+                if encoded_path:
                     cleanup_file(encoded_path)
-                if thumbnail_path is not None:
+                if thumbnail_path:
                     cleanup_file(thumbnail_path)
                 self._reserved_encode_space = max(0, self._reserved_encode_space - job.reserved_space)
                 self._active_jobs.pop(job.id, None)
@@ -431,7 +460,6 @@ class EncodeQueue:
                 self._queue.task_done()
                 self._save_journal()
                 await self._update_user_status(job.owner_id)
-                # Clean up user status message if no more jobs
                 remaining = [j for j in self._active_jobs.values() if j.owner_id == job.owner_id] + \
                             [j for j in list(self._queue._queue) if j.owner_id == job.owner_id]
                 if not remaining:
@@ -462,7 +490,7 @@ def friendly_error(exc: Exception) -> str:
     return "Encoding or transfer failed. Check that the video is valid and try again."
 
 
-def _schedule_delete(msg: types.Message) -> None:
+def _schedule_delete(msg: Message) -> None:
     async def _del():
         await asyncio.sleep(AUTO_DELETE_STATUS_DELAY)
         try:
@@ -472,7 +500,9 @@ def _schedule_delete(msg: types.Message) -> None:
     asyncio.create_task(_del())
 
 
-def cleanup_file(path: Path) -> None:
+def cleanup_file(path: Path | None) -> None:
+    if path is None:
+        return
     try:
         if path.exists():
             path.unlink()

@@ -1,6 +1,6 @@
 # Enchanted Encoder
 
-A self-hosted Telegram bot that re-encodes videos on the fly using FFmpeg. Drop a video in chat — the bot downloads it, compresses or converts it with your chosen profile, and sends the result back. Powered by [pytdbot](https://github.com/pytdbot/client) (MTProto) for reliable streaming uploads and real-time progress.
+A self-hosted Telegram bot that re-encodes videos on the fly using FFmpeg. Drop a video in chat — the bot downloads it, compresses or converts it with your chosen profile, and sends the result back. Uses **[pyroblack](https://github.com/eyMarv/pyroblack)** (MTProto) for message handling, status updates, and uploads, and **[TDLib](https://core.telegram.org/tdlib)** via pytdbot for efficient file downloads.
 
 ---
 

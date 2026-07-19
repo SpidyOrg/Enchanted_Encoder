@@ -1,2 +1,1 @@
-"""Minimal Pytdbot Telegram bot."""
-
+"""Telegram Video Encoder Bot — pyroblack + TDLib hybrid."""
