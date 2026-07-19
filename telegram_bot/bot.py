@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ HELP_TEXT = "\n".join((
     "/queue or /status - show queue status",
     "/cancel <job_id> - cancel your queued or active job",
     "/cancel as a reply - cancel the replied video task",
+    "/check - check installed encoders (H.264/HEVC/AV1)",
 ))
 UPLOAD_PROGRESS = UploadProgress()
 ENCODE_QUEUE: EncodeQueue | None = None
@@ -127,13 +129,26 @@ def register_handlers(client: Client, config: BotConfig) -> None:
                 if len(parts) == 1:
                     await message.reply_text(_settings_store().get(user_id).describe() + status_footer())
                 else:
-                    settings = _settings_store().set_profile(user_id, parts[1])
-                    if settings is None:
-                        await message.reply_text("❌ Unknown profile.\n\n" + _settings_store().get(user_id).describe() + status_footer())
+                    action = parts[1].strip().lower()
+                    if action == "document":
+                        current = _settings_store().get(user_id).send_as_document
+                        settings = _settings_store().set_document(user_id, not current)
+                        await message.reply_text(f"✅ Send as document is now {'on' if settings.send_as_document else 'off'}" + status_footer())
+                    elif action.startswith("document "):
+                        val = action.split(None, 1)[1]
+                        is_on = val in ("on", "yes", "true", "1")
+                        settings = _settings_store().set_document(user_id, is_on)
+                        await message.reply_text(f"✅ Send as document is now {'on' if settings.send_as_document else 'off'}" + status_footer())
                     else:
-                        await message.reply_text(f"✅ Your default profile is now {settings.profile.label}" + status_footer())
+                        settings = _settings_store().set_profile(user_id, parts[1])
+                        if settings is None:
+                            await message.reply_text("❌ Unknown profile.\n\n" + _settings_store().get(user_id).describe() + status_footer())
+                        else:
+                            await message.reply_text(f"✅ Your default profile is now {settings.profile.label}" + status_footer())
             elif command in {"/queue", "/status"}:
-                await message.reply_text(_encode_queue().summary())
+                await message.reply_text(_encode_queue().user_summary(_sender_id(message)))
+            elif command == "/check":
+                await handle_check(message)
             elif command == "/cancel":
                 await handle_cancel(message, text)
             else:
@@ -158,35 +173,89 @@ async def handle_media(client: Client, message: types.Message, media_file: types
     if queue.waiting >= queue.capacity:
         await message.reply_text("🚦 Queue is full. Try again later." + status_footer())
         return
-    if not queue.reserve_user(owner_id):
-        await message.reply_text("🚦 You already have a download, queued job, or active job. Please wait or cancel it first." + status_footer())
+    if not queue.reserve_download(owner_id):
+        await message.reply_text(
+            "⏳ A download is already in progress for you. "
+            "Please wait for it to finish before sending another file."
+            + status_footer()
+        )
         return
-    status = await message.reply_text("Preparing transfer...")
-    if getattr(status, "is_error", False):
-        queue.release_user(owner_id)
+    status = await queue.get_or_create_user_status(owner_id, message)
+    if status is None:
+        queue.release_download(owner_id)
         return
     downloaded_path: Path | None = None
     try:
         required_space = int(file_size * DISK_HEADROOM_MULTIPLIER)
         if file_size and not has_free_space(config.files_dir, required_space):
             raise RuntimeError("Insufficient free disk space for this video")
-        downloaded_path = await download_media(client, media_file, ProgressMessage(status, "📥 Downloading", file_size))
-        settings = _settings_store().get(owner_id)
-        job = VideoJob(
-            id=queue.next_id(), message=message, status=status, source_path=downloaded_path,
-            profile=settings.profile, queued_at=time.time(), source_message_id=message.id,
-            owner_id=owner_id, owner_label=_sender_label(message), filename=_media_filename(media_file),
-        )
-        if await queue.enqueue(job) is None:
-            cleanup_file(downloaded_path)
-            queue.release_user(owner_id)
-            await safe_edit_text(status, "🚦 Queue is full. Try again later." + status_footer())
+        text = queue._render_user_status(owner_id, f"📥 Downloading: {_media_filename(media_file)}")
+        await safe_edit_text(status, text)
+        downloaded_path = await download_media(client, media_file, ProgressMessage(status, "📥 Downloading", file_size, queue=queue, user_id=owner_id))
     except Exception as exc:
         logging.getLogger(__name__).exception("Media transfer failed")
         if downloaded_path is not None:
             cleanup_file(downloaded_path)
-        queue.release_user(owner_id)
+        queue.release_download(owner_id)
         await safe_edit_text(status, "❌ " + friendly_error(exc) + status_footer())
+        return
+
+    queue.release_download(owner_id)
+
+    if not queue.reserve_user_slot(owner_id):
+        cleanup_file(downloaded_path)
+        count = queue._user_jobs.get(owner_id, 0)
+        await safe_edit_text(
+            status,
+            f"🚦 You already have {count} job{'s' if count != 1 else ''} "
+            f"queued or active (max {queue._max_jobs_per_user}). "
+            f"Wait for one to finish or use /cancel."
+            + status_footer()
+        )
+        return
+
+    settings = _settings_store().get(owner_id)
+    job = VideoJob(
+        id=queue.next_id(), message=message, status=status, source_path=downloaded_path,
+        profile=settings.profile, queued_at=time.time(), source_message_id=message.id,
+        owner_id=owner_id, owner_label=_sender_label(message), filename=_media_filename(media_file),
+        send_as_document=settings.send_as_document,
+    )
+    if await queue.enqueue(job) is None:
+        cleanup_file(downloaded_path)
+        queue.release_user(owner_id)
+        await safe_edit_text(status, "🚦 Queue is full. Try again later." + status_footer())
+        return
+
+    await queue._update_user_status(owner_id)
+
+
+async def handle_check(message: types.Message) -> None:
+    import subprocess
+
+    target = ("libx264", "libx265", "libsvtav1")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=30,
+        )
+        encoders = result.stdout
+    except FileNotFoundError:
+        await message.reply_text("❌ ffmpeg is not installed on this server." + status_footer())
+        return
+    except Exception as exc:
+        await message.reply_text(f"❌ Could not list ffmpeg encoders: {exc}" + status_footer())
+        return
+
+    lines = ["🎛 Encoder availability:\n"]
+    for name in target:
+        if name in encoders:
+            lines.append(f"✅ {name} — available")
+        else:
+            lines.append(f"❌ {name} — NOT installed")
+    lines.append(f"\n🖥 Cores: {os.cpu_count() or 'unknown'}")
+    lines.append(f"🧵 Encode threads: {_encode_queue()._encode_threads}")
+    await message.reply_text("\n".join(lines) + status_footer())
 
 
 async def handle_cancel(message: types.Message, text: str) -> None:
@@ -225,6 +294,7 @@ def main() -> None:
         config.output_dir,
         max_jobs_per_user=config.max_jobs_per_user,
         max_concurrent_encoders=config.max_concurrent_encoders,
+        journal_path=config.settings_path.parent / "queue_journal.json",
     )
     logging.getLogger(__name__).info("Starting Telegram bot")
     create_client(config).run()

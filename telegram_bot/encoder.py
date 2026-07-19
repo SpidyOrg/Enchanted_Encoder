@@ -6,10 +6,15 @@ import os
 import signal
 import time
 from pathlib import Path
+from typing import Any
 
 from telegram_bot.runtime import status_footer
 from telegram_bot.settings import EncodeProfile
 from telegram_bot.transfer import BAR_WIDTH, ProgressMessage, safe_edit_text
+
+
+STALL_TIMEOUT = 600
+LINE_READ_TIMEOUT = 60
 
 
 async def encode_h264_720p(
@@ -19,44 +24,17 @@ async def encode_h264_720p(
     profile: EncodeProfile,
     cancel_event: asyncio.Event | None = None,
     job_id: int | None = None,
+    queue: Any = None,
+    user_id: str = "",
+    encode_threads: int = 0,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     job_suffix = f".job-{job_id}" if job_id is not None else ""
-    target = output_dir / f"{source.stem}{job_suffix}.encoded.{profile.key}.mp4"
+    target = output_dir / f"{source.stem}{job_suffix}.encoded.{profile.codec}.mp4"
     metadata = await probe_video_metadata(source)
     duration = metadata.duration
 
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-vf",
-        f"scale=-2:{profile.resolution}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        profile.x264_preset,
-        "-threads",
-        "0",
-        "-crf",
-        str(profile.crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        profile.audio_bitrate,
-        "-movflags",
-        "+faststart",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        str(target),
-    ]
+    command = _build_ffmpeg_command(source, target, profile, encode_threads)
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -68,6 +46,7 @@ async def encode_h264_720p(
     last_edit_at = 0.0
     out_time = 0.0
     ffmpeg_speed = 0.0
+    last_progress = time.monotonic()
 
     assert process.stdout is not None
     try:
@@ -76,7 +55,18 @@ async def encode_h264_720p(
                 await stop_process(process)
                 raise asyncio.CancelledError("Encoding cancelled")
 
-            line = await process.stdout.readline()
+            try:
+                line = await asyncio.wait_for(
+                    process.stdout.readline(), timeout=LINE_READ_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                if time.monotonic() - last_progress > STALL_TIMEOUT:
+                    await stop_process(process)
+                    raise RuntimeError(
+                        "Encoding stalled: no progress for 10 minutes"
+                    )
+                continue
+
             if not line:
                 break
 
@@ -87,20 +77,27 @@ async def encode_h264_720p(
                 out_time = max(out_time, _timestamp_to_seconds(value))
             elif key == "speed":
                 ffmpeg_speed = _speed_to_float(value)
+            if key in ("out_time_us", "out_time_ms", "out_time", "speed"):
+                last_progress = time.monotonic()
 
             now = time.monotonic()
             if now - last_edit_at >= 5:
                 last_edit_at = now
+                encode_text = render_encode_progress(
+                    out_time,
+                    duration,
+                    now - started_at,
+                    ffmpeg_speed,
+                    profile=profile,
+                    job_id=job_id,
+                )
+                if queue and user_id:
+                    text = queue._render_user_status(user_id, encode_text)
+                else:
+                    text = encode_text + status_footer()
                 await safe_edit_text(
                     progress.message,
-                    render_encode_progress(
-                        out_time,
-                        duration,
-                        now - started_at,
-                        ffmpeg_speed,
-                        profile=profile,
-                        job_id=job_id,
-                    )
+                    text,
                 )
     except asyncio.CancelledError:
         await stop_process(process)
@@ -123,18 +120,43 @@ async def encode_h264_720p(
             target.unlink()
         raise RuntimeError("Encoded output was not created")
 
-    await safe_edit_text(
-        progress.message,
-        render_encode_progress(
-            duration,
-            duration,
-            time.monotonic() - started_at,
-            ffmpeg_speed,
-            profile=profile,
-            job_id=job_id,
-        )
+    encode_text = render_encode_progress(
+        duration,
+        duration,
+        time.monotonic() - started_at,
+        ffmpeg_speed,
+        profile=profile,
+        job_id=job_id,
     )
+    if queue and user_id:
+        text = queue._render_user_status(user_id, encode_text)
+    else:
+        text = encode_text + status_footer()
+    await safe_edit_text(progress.message, text)
     return target
+
+
+def _build_ffmpeg_command(source: Path, target: Path, profile: EncodeProfile, encode_threads: int = 0) -> list[str]:
+    base = [
+        "ffmpeg",
+        "-hide_banner", "-y",
+        "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", f"scale=-2:{profile.resolution}",
+        "-c:v", profile.encoder_name,
+        "-preset", profile.preset,
+        "-threads", str(max(encode_threads, 1)),
+        "-crf", str(profile.crf),
+        "-c:a", "aac",
+        "-b:a", profile.audio_bitrate,
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
+        str(target),
+    ]
+    if profile.codec == "hevc":
+        base.insert(-6, "-tag:v")
+        base.insert(-6, "hvc1")
+    return base
 
 
 class VideoMetadata:
@@ -226,15 +248,15 @@ def render_encode_progress(
 
     job_line = f"🆔 Job: {job_id}\n" if job_id is not None else ""
     profile_line = f"🎛 Profile: {profile.label}\n" if profile else ""
+    codec_label = (profile.codec.upper() if profile else "H.264")
     return (
-        "🎬 Encoding\n"
+        f"🎬 Encoding ({codec_label})\n"
         f"{job_line}"
         f"{profile_line}"
         f"[{bar}] {ratio * 100:.1f}%\n"
         f"{format_time(current)} / {format_time(total)}\n"
         f"⚡ Speed: {speed:.2f}x\n"
         f"⏳ ETA: {eta}"
-        f"{status_footer()}"
     )
 
 

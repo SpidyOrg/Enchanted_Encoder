@@ -20,6 +20,7 @@ STATUS_EDIT_INTERVAL = 5.0
 STATUS_EDIT_TIMEOUT = 12.0
 STATUS_CHAT_INTERVAL = 1.2
 MAX_RATE_LIMIT_RETRIES = 3
+STALL_TIMEOUT = 600
 LOGGER = logging.getLogger(__name__)
 _next_status_edit_by_chat: dict[str, float] = {}
 
@@ -57,6 +58,8 @@ class ProgressMessage:
     last_text: str = ""
     extra: str = ""
     next_edit_at: float = field(init=False)
+    queue: Any = None
+    user_id: str = ""
 
     def __post_init__(self) -> None:
         message_id = int(getattr(self.message, "id", id(self.message)) or id(self.message))
@@ -67,13 +70,17 @@ class ProgressMessage:
         if not force and now < self.next_edit_at:
             return
 
-        text = render_progress(
+        progress = render_progress(
             self.label,
             current,
             self.total,
             now - self.started_at,
             self.extra,
         )
+        if self.queue and self.user_id:
+            text = self.queue._render_user_status(self.user_id, progress)
+        else:
+            text = progress + status_footer()
         if text == self.last_text:
             return
 
@@ -129,7 +136,6 @@ def render_progress(
         f"{human_size(current)} / {total_text}\n"
         f"⚡ Speed: {human_size(speed)}/s\n"
         f"⏳ ETA: {eta}"
-        f"{status_footer()}"
     )
 
 
@@ -215,8 +221,19 @@ async def upload_document(
     )
 
     try:
+        last_upload_progress = time.monotonic()
+        last_uploaded = 0
         while not send_task.done():
-            await progress.update(tracker.get(str(path)))
+            uploaded = tracker.get(str(path))
+            if uploaded != last_uploaded:
+                last_uploaded = uploaded
+                last_upload_progress = time.monotonic()
+            elif time.monotonic() - last_upload_progress > STALL_TIMEOUT:
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await send_task
+                raise RuntimeError("Upload stalled: no progress for 10 minutes")
+            await progress.update(uploaded)
             await asyncio.sleep(1)
 
         result = await send_task
@@ -261,6 +278,8 @@ async def upload_video(
                     height=height,
                 )
             )
+            last_upload_progress = time.monotonic()
+            last_uploaded = 0
             while not send_task.done():
                 if cancel_event and cancel_event.is_set():
                     await safe_edit_text(
@@ -272,7 +291,16 @@ async def upload_video(
                     with contextlib.suppress(asyncio.CancelledError):
                         await send_task
                     raise asyncio.CancelledError("Upload cancelled")
-                await progress.update(tracker.get(str(path)))
+                uploaded = tracker.get(str(path))
+                if uploaded != last_uploaded:
+                    last_uploaded = uploaded
+                    last_upload_progress = time.monotonic()
+                elif time.monotonic() - last_upload_progress > STALL_TIMEOUT:
+                    send_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await send_task
+                    raise RuntimeError("Upload stalled: no progress for 10 minutes")
+                await progress.update(uploaded)
                 await asyncio.sleep(1)
 
             result = await send_task
