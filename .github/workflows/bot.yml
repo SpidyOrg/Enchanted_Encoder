@@ -23,12 +23,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Install TDLib
+      - name: Install system deps (TDLib, FFmpeg)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libtdjson-dev 2>/dev/null ||
-          sudo apt-get install -y -qq libtdjson 2>/dev/null ||
-          { echo "TDLib not found, building from source..."; }
+          sudo apt-get install -y -qq ffmpeg libtdjson-dev 2>/dev/null ||
+          sudo apt-get install -y -qq ffmpeg libtdjson 2>/dev/null ||
+          { sudo apt-get install -y -qq ffmpeg && echo "TDLib not found, pytdbot may use bundled lib"; }
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -46,12 +46,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Install TDLib
+      - name: Install system deps (TDLib, FFmpeg)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libtdjson-dev 2>/dev/null ||
-          sudo apt-get install -y -qq libtdjson 2>/dev/null ||
-          { echo "TDLib not found, building from source..."; }
+          sudo apt-get install -y -qq ffmpeg libtdjson-dev 2>/dev/null ||
+          sudo apt-get install -y -qq ffmpeg libtdjson 2>/dev/null ||
+          { sudo apt-get install -y -qq ffmpeg && echo "TDLib not found, pytdbot may use bundled lib"; }
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
