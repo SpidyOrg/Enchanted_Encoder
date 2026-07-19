@@ -6,3 +6,6 @@ encoded/
 __pycache__/
 *.py[cod]
 tdlib.log
+*.session
+*.session-shm
+*.session-wal

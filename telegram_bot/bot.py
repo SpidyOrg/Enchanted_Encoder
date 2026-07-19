@@ -309,7 +309,6 @@ async def main_async() -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         bot_token=config.bot_token,
-        in_memory=True,
     )
     register_handlers(app, config)
 
