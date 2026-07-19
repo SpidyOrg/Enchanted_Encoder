@@ -1,0 +1,2 @@
+"""Minimal Pytdbot Telegram bot."""
+

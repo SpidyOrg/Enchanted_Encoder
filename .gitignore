@@ -1,0 +1,8 @@
+.env
+bot_settings.json
+.venv/
+.tdlib/
+encoded/
+__pycache__/
+*.py[cod]
+tdlib.log
