@@ -79,7 +79,7 @@ def get_config() -> BotConfig:
         tdjson_lib_path=os.environ.get("PYTDBOT_TDJSON_LIB") or None,
         settings_path=Path(os.environ.get("BOT_SETTINGS_PATH", "bot_settings.json")),
         output_dir=Path(os.environ.get("BOT_OUTPUT_DIR", "encoded")),
-        max_jobs_per_user=max(1, int(os.environ.get("MAX_JOBS_PER_USER", "3"))),
-        max_concurrent_encoders=min(3, max(1, int(os.environ.get("MAX_CONCURRENT_ENCODERS", "2")))),
+        max_jobs_per_user=max(1, int(os.environ.get("MAX_JOBS_PER_USER", "1"))),
+        max_concurrent_encoders=min(3, max(1, int(os.environ.get("MAX_CONCURRENT_ENCODERS", "1")))),
         stale_file_hours=max(1, int(os.environ.get("STALE_FILE_HOURS", "24"))),
     )

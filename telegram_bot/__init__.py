@@ -1,1 +1,1 @@
-"""Telegram Video Encoder Bot — pyroblack + TDLib hybrid."""
+"""Enchanted Encoder — single-architecture TDLib (pytdbot) video encoder bot."""

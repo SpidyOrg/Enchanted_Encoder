@@ -13,8 +13,9 @@ from telegram_bot.settings import EncodeProfile
 from telegram_bot.transfer import BAR_WIDTH, ProgressMessage, safe_edit_text
 
 
-STALL_TIMEOUT = 600
-LINE_READ_TIMEOUT = 60
+STALL_TIMEOUT = 600  # 10 minutes
+LINE_READ_TIMEOUT = 60  # 1 minute per line read
+FFMPEG_LOG_LINES = 50  # Keep last N log lines for error reporting
 
 
 async def encode_h264_720p(
@@ -28,11 +29,36 @@ async def encode_h264_720p(
     user_id: str = "",
     encode_threads: int = 0,
 ) -> Path:
+    """Encode video file with progress tracking and error handling.
+    
+    Args:
+        source: Source video file path
+        output_dir: Output directory for encoded file
+        progress: Progress message tracker
+        profile: Encode profile with codec settings
+        cancel_event: Optional cancellation event
+        job_id: Optional job ID for logging
+        queue: Optional queue reference for status updates
+        user_id: Optional user ID for status updates
+        encode_threads: Number of threads to use for encoding
+        
+    Returns:
+        Path to encoded output file
+        
+    Raises:
+        asyncio.CancelledError: If encoding is cancelled
+        RuntimeError: If encoding fails
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     job_suffix = f".job-{job_id}" if job_id is not None else ""
     target = output_dir / f"{source.stem}{job_suffix}.encoded.{profile.codec}.mp4"
-    metadata = await probe_video_metadata(source)
-    duration = metadata.duration
+    
+    # Probe video metadata for progress tracking
+    try:
+        metadata = await probe_video_metadata(source)
+        duration = metadata.duration
+    except Exception as e:
+        raise RuntimeError(f"Failed to probe video: {e}") from e
 
     command = _build_ffmpeg_command(source, target, profile, encode_threads)
 
@@ -47,79 +73,132 @@ async def encode_h264_720p(
     out_time = 0.0
     ffmpeg_speed = 0.0
     last_progress = time.monotonic()
+    stderr_lines: list[str] = []  # Collect stderr for error reporting
 
     assert process.stdout is not None
+    assert process.stderr is not None
+    
     try:
+        # Create tasks for reading stdout and stderr concurrently
+        async def read_stdout() -> None:
+            nonlocal out_time, ffmpeg_speed, last_progress, last_edit_at
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=LINE_READ_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                
+                if not line:
+                    break
+                
+                key, _, value = line.decode("utf-8", errors="replace").strip().partition("=")
+                if key in {"out_time_us", "out_time_ms"}:
+                    out_time = max(out_time, _progress_time(value))
+                    last_progress = time.monotonic()
+                elif key == "out_time":
+                    out_time = max(out_time, _timestamp_to_seconds(value))
+                    last_progress = time.monotonic()
+                elif key == "speed":
+                    ffmpeg_speed = _speed_to_float(value)
+                    last_progress = time.monotonic()
+                
+                # Update progress periodically
+                now = time.monotonic()
+                if now - last_edit_at >= 5:
+                    last_edit_at = now
+                    encode_text = render_encode_progress(
+                        out_time,
+                        duration,
+                        now - started_at,
+                        ffmpeg_speed,
+                        profile=profile,
+                        job_id=job_id,
+                    )
+                    if queue and user_id:
+                        text = queue._render_user_status(user_id, encode_text)
+                    else:
+                        text = encode_text + status_footer()
+                    await safe_edit_text(progress.message, text)
+        
+        async def read_stderr() -> None:
+            while True:
+                try:
+                    line = await process.stderr.readline()
+                    if not line:
+                        break
+                    decoded = line.decode("utf-8", errors="replace").strip()
+                    if decoded:
+                        stderr_lines.append(decoded)
+                        # Keep only last N lines
+                        if len(stderr_lines) > FFMPEG_LOG_LINES:
+                            stderr_lines.pop(0)
+                except Exception:
+                    break
+        
+        # Run both readers concurrently
+        stdout_task = asyncio.create_task(read_stdout())
+        stderr_task = asyncio.create_task(read_stderr())
+        
+        # Monitor for cancellation and stalls
         while True:
             if cancel_event and cancel_event.is_set():
                 await stop_process(process)
+                stdout_task.cancel()
+                stderr_task.cancel()
                 raise asyncio.CancelledError("Encoding cancelled")
-
-            try:
-                line = await asyncio.wait_for(
-                    process.stdout.readline(), timeout=LINE_READ_TIMEOUT
+            
+            # Check for stall
+            if time.monotonic() - last_progress > STALL_TIMEOUT:
+                await stop_process(process)
+                stdout_task.cancel()
+                stderr_task.cancel()
+                raise RuntimeError(
+                    f"Encoding stalled: no progress for {STALL_TIMEOUT // 60} minutes"
                 )
-            except asyncio.TimeoutError:
-                if time.monotonic() - last_progress > STALL_TIMEOUT:
-                    await stop_process(process)
-                    raise RuntimeError(
-                        "Encoding stalled: no progress for 10 minutes"
-                    )
-                continue
-
-            if not line:
+            
+            # Check if process finished
+            if process.returncode is not None:
                 break
-
-            key, _, value = line.decode("utf-8", errors="replace").strip().partition("=")
-            if key in {"out_time_us", "out_time_ms"}:
-                out_time = max(out_time, _progress_time(value))
-            elif key == "out_time":
-                out_time = max(out_time, _timestamp_to_seconds(value))
-            elif key == "speed":
-                ffmpeg_speed = _speed_to_float(value)
-            if key in ("out_time_us", "out_time_ms", "out_time", "speed"):
-                last_progress = time.monotonic()
-
-            now = time.monotonic()
-            if now - last_edit_at >= 5:
-                last_edit_at = now
-                encode_text = render_encode_progress(
-                    out_time,
-                    duration,
-                    now - started_at,
-                    ffmpeg_speed,
-                    profile=profile,
-                    job_id=job_id,
-                )
-                if queue and user_id:
-                    text = queue._render_user_status(user_id, encode_text)
-                else:
-                    text = encode_text + status_footer()
-                await safe_edit_text(
-                    progress.message,
-                    text,
-                )
+            
+            await asyncio.sleep(1)
+        
+        # Wait for readers to finish
+        try:
+            await asyncio.wait_for(stdout_task, timeout=5)
+        except asyncio.TimeoutError:
+            stdout_task.cancel()
+        
+        try:
+            await asyncio.wait_for(stderr_task, timeout=5)
+        except asyncio.TimeoutError:
+            stderr_task.cancel()
+        
     except asyncio.CancelledError:
         await stop_process(process)
         if target.exists():
             target.unlink()
         raise
-
-    stderr = b""
-    if process.stderr is not None:
-        stderr = await process.stderr.read()
+    except Exception as e:
+        await stop_process(process)
+        if target.exists():
+            target.unlink()
+        raise RuntimeError(f"Encoding process error: {e}") from e
 
     return_code = await process.wait()
     if return_code != 0:
-        error = stderr.decode("utf-8", errors="replace").strip().splitlines()
-        detail = error[-1] if error else "ffmpeg failed"
-        raise RuntimeError(detail)
+        error_detail = stderr_lines[-1] if stderr_lines else "ffmpeg failed with no output"
+        # Include last few lines of stderr for debugging
+        context = "\n".join(stderr_lines[-5:]) if len(stderr_lines) > 1 else error_detail
+        raise RuntimeError(f"Encoding failed (code {return_code}): {context}")
 
     if not target.exists() or target.stat().st_size == 0:
         if target.exists():
             target.unlink()
-        raise RuntimeError("Encoded output was not created")
+        raise RuntimeError("Encoded output was not created or is empty")
 
+    # Final progress update
     encode_text = render_encode_progress(
         duration,
         duration,
@@ -133,11 +212,24 @@ async def encode_h264_720p(
     else:
         text = encode_text + status_footer()
     await safe_edit_text(progress.message, text)
+    
     return target
 
 
 def _build_ffmpeg_command(source: Path, target: Path, profile: EncodeProfile, encode_threads: int = 0) -> list[str]:
-    base = [
+    """Build FFmpeg command with proper codec-specific arguments.
+    
+    Args:
+        source: Source video path
+        target: Output video path
+        profile: Encode profile with codec settings
+        encode_threads: Number of threads for encoding
+        
+    Returns:
+        List of command arguments for subprocess execution
+    """
+    # Base command with common arguments
+    cmd = [
         "ffmpeg",
         "-hide_banner", "-y",
         "-i", str(source),
@@ -149,14 +241,22 @@ def _build_ffmpeg_command(source: Path, target: Path, profile: EncodeProfile, en
         "-crf", str(profile.crf),
         "-c:a", "aac",
         "-b:a", profile.audio_bitrate,
-        "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats",
-        str(target),
     ]
+    
+    # Add codec-specific arguments BEFORE output path
     if profile.codec == "hevc":
-        base.insert(-6, "-tag:v")
-        base.insert(-6, "hvc1")
-    return base
+        # HEVC requires hvc1 tag for better compatibility
+        cmd.extend(["-tag:v", "hvc1"])
+    
+    # Output formatting and path (must be last)
+    cmd.extend([
+        "-movflags", "+faststart",
+        "-progress", "pipe:1",
+        "-nostats",
+        str(target),
+    ])
+    
+    return cmd
 
 
 class VideoMetadata:
@@ -242,7 +342,7 @@ def render_encode_progress(
 ) -> str:
     ratio = min(current / total, 1.0) if total > 0 else 0.0
     filled = int(ratio * BAR_WIDTH)
-    bar = "#" * filled + "-" * (BAR_WIDTH - filled)
+    bar = "█" * filled + "░" * (BAR_WIDTH - filled)
     speed = ffmpeg_speed or (current / elapsed if elapsed > 0 else 0.0)
     eta = encode_eta(current, total, speed)
 

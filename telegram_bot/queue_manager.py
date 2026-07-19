@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pyrogram.types import Message
+from pytdbot import types
 
 from telegram_bot.downloader import TDLibDownloader
 from telegram_bot.encoder import (
@@ -20,6 +20,7 @@ from telegram_bot.encoder import (
     make_thumbnail,
     probe_video_metadata,
 )
+from telegram_bot.keyboards import build_queue_keyboard
 from telegram_bot.runtime import format_duration, has_free_space, status_footer
 from telegram_bot.settings import EncodeProfile
 from telegram_bot.transfer import (
@@ -40,8 +41,8 @@ AUTO_DELETE_STATUS_DELAY = 30
 @dataclass
 class VideoJob:
     id: int
-    message: Message
-    status: Message
+    message: types.Message
+    status: types.Message
     profile: EncodeProfile
     queued_at: float
     owner_id: str
@@ -59,6 +60,16 @@ class VideoJob:
 
 
 class EncodeQueue:
+    """Thread-safe encode queue with per-user job limits and status tracking.
+    
+    Attributes:
+        encode_threads: Number of threads per encoder
+        max_jobs_per_user: Maximum concurrent jobs per user
+        active: Whether there are active jobs
+        waiting: Number of jobs waiting in queue
+        capacity: Maximum queue capacity
+    """
+    
     def __init__(
         self,
         output_dir: Path = Path("encoded"),
@@ -68,6 +79,16 @@ class EncodeQueue:
         max_concurrent_encoders: int = 2,
         journal_path: Path | None = None,
     ) -> None:
+        """Initialize encode queue.
+        
+        Args:
+            output_dir: Directory for encoded output files
+            downloader: TDLib downloader instance
+            max_size: Maximum queue size
+            max_jobs_per_user: Maximum jobs per user
+            max_concurrent_encoders: Maximum concurrent encoding processes
+            journal_path: Path to queue journal file
+        """
         self._queue: asyncio.Queue[VideoJob] = asyncio.Queue(maxsize=max_size)
         self._output_dir = output_dir
         self._downloader = downloader
@@ -79,9 +100,13 @@ class EncodeQueue:
         self._reserved_encode_space = 0
         self._next_id = 1
         self._user_jobs: dict[str, int] = {}
-        self._user_status: dict[str, Message] = {}
+        self._user_status: dict[str, types.Message] = {}
         self._user_status_locks: dict[str, asyncio.Lock] = {}
         self._journal_path = journal_path
+        
+        # Global lock for queue operations
+        self._queue_lock = asyncio.Lock()
+        
         self._load_journal()
 
     @property
@@ -122,23 +147,42 @@ class EncodeQueue:
             self._user_jobs[user_id] = count - 1
 
     def user_summary(self, user_id: str) -> str:
+        """Generate user-specific queue summary with better formatting.
+        
+        Args:
+            user_id: User ID to generate summary for
+            
+        Returns:
+            Formatted queue status string
+        """
         active = [j for j in self._active_jobs.values() if j.owner_id == user_id]
         queued = [j for j in list(self._queue._queue) if j.owner_id == user_id]
-        lines = [f"📋 Your Queue — {len(active) + len(queued)} job{'s' if len(active) + len(queued) != 1 else ''}"]
+        total = len(active) + len(queued)
+        
+        lines = [f"📋 <b>Your Queue</b> — {total} job{'s' if total != 1 else ''}"]
+        
         if active:
-            lines.append("")
+            lines.append("\n<b>🔄 Active:</b>")
             for j in active:
                 elapsed = format_duration(time.time() - (j.started_at or time.time()))
-                icon = "📤" if j.state == "uploading" else ("📥" if j.state == "downloading" else "🎬")
-                lines.append(f"{icon} #{j.id} {j.state.title()}: {_short(j.filename)} [{elapsed}]")
+                if j.state == "uploading":
+                    icon, state = "📤", "Uploading"
+                elif j.state == "downloading":
+                    icon, state = "📥", "Downloading"
+                else:
+                    icon, state = "🎬", "Encoding"
+                lines.append(f"{icon} <b>#{j.id}</b> {state}: {_short(j.filename)} [{elapsed}]")
+        
         if queued:
-            lines.append("")
+            lines.append("\n<b>⏳ Queued:</b>")
             for pos, j in enumerate(queued, 1):
-                lines.append(f"⏳ #{j.id} Queued ({pos}): {_short(j.filename)} — {j.profile.label}")
-        if not active and not queued:
-            lines.append("\nNo active or queued jobs.")
-        lines.append(f"\nSlots: {len(active) + len(queued)}/{self._max_jobs_per_user} used")
-        return "\n".join(lines) + status_footer()
+                lines.append(f"  {pos}. #{j.id} {_short(j.filename)} — {j.profile.name}")
+        
+        if not total:
+            lines.append("\n✅ No active or queued jobs.")
+        
+        lines.append(f"\n📊 Slots: {total}/{self._max_jobs_per_user} used")
+        return "\n".join(lines)
 
     def _journal_path_resolved(self) -> Path | None:
         return self._journal_path
@@ -177,12 +221,22 @@ class EncodeQueue:
                     "send_as_document": j.send_as_document,
                 })
         try:
+            import tempfile
             journal.parent.mkdir(parents=True, exist_ok=True)
-            journal.write_text(
-                json.dumps({"version": 1, "next_id": self._next_id, "jobs": entries}, indent=2),
-                encoding="utf-8",
-            )
+            payload = json.dumps({"version": 1, "next_id": self._next_id, "jobs": entries}, indent=2)
+            
+            with tempfile.NamedTemporaryFile("w", dir=journal.parent, delete=False, encoding="utf-8") as temp_file:
+                temp_file.write(payload)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = Path(temp_file.name)
+            os.replace(temp_path, journal)
         except OSError as exc:
+            try:
+                if 'temp_path' in locals() and temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
             LOGGER.warning("Could not save queue journal: %s", exc)
 
     def _load_journal(self) -> None:
@@ -236,53 +290,102 @@ class EncodeQueue:
         job_id: int | None = None,
         message_id: int | None = None,
     ) -> str:
+        """Cancel a job by ID or source message ID.
+        
+        Args:
+            requester_id: User ID requesting cancellation
+            job_id: Job ID to cancel
+            message_id: Source message ID to match against
+            
+        Returns:
+            Human-readable result message
+        """
+        # Check active jobs first
         for active in self._active_jobs.values():
             if not _matches(active, job_id, message_id):
                 continue
             if active.owner_id != requester_id:
-                return "You can only cancel your own task."
+                return "❌ You can only cancel your own task."
             active.cancel_event.set()
             if active.state == "uploading":
-                return f"🛑 Cancellation requested for upload of job {active.id}. Telegram may finish the already-started upload."
-            return f"🛑 Cancelling active job {active.id}."
+                return f"⚠️ Cancellation requested for upload of job {active.id}. Telegram may finish the already-started upload."
+            return f"🛑 Cancelling active job {active.id}..."
 
-        queued = list(self._queue._queue)
-        for job in queued:
-            if not _matches(job, job_id, message_id):
-                continue
-            if job.owner_id != requester_id:
-                return "You can only cancel your own task."
-            self._queue._queue = deque(item for item in queued if item is not job)
-            self._queue.task_done()
-            job.cancel_event.set()
-            cleanup_file(job.source_path) if job.source_path else None
-            self.release_user(job.owner_id)
-            await self._update_user_status(job.owner_id)
+        # Check queued jobs - use thread-safe queue operations
+        # Create a new queue with all items except the one to cancel
+        cancelled_job: VideoJob | None = None
+        remaining_jobs: list[VideoJob] = []
+        
+        # Drain the queue to find and remove the job
+        temp_jobs: list[VideoJob] = []
+        while not self._queue.empty():
+            try:
+                job = self._queue.get_nowait()
+                if _matches(job, job_id, message_id) and job.owner_id == requester_id:
+                    cancelled_job = job
+                    job.cancel_event.set()
+                else:
+                    temp_jobs.append(job)
+            except asyncio.QueueEmpty:
+                break
+        
+        # Put remaining jobs back
+        for job in temp_jobs:
+            try:
+                self._queue.put_nowait(job)
+            except asyncio.QueueFull:
+                LOGGER.error("Queue full when restoring jobs during cancel")
+        
+        if cancelled_job:
+            # Clean up downloaded file if it exists
+            if cancelled_job.source_path:
+                cleanup_file(cancelled_job.source_path)
+            self.release_user(cancelled_job.owner_id)
+            await self._update_user_status(cancelled_job.owner_id)
             self._save_journal()
-            return f"🗑 Cancelled queued job {job.id}."
-        return "No matching task found."
+            return f"🗑 Cancelled queued job {cancelled_job.id}."
+        
+        return "❌ No matching task found."
 
-    async def get_or_create_user_status(self, user_id: str, source_message: Message) -> Message | None:
-        existing = self._user_status.get(user_id)
-        if existing is not None:
-            return existing
-        status = await source_message.reply_text("📋 Preparing your queue..." + status_footer())
-        if status is None:
-            return None
-        self._user_status[user_id] = status
-        self._user_status_locks[user_id] = asyncio.Lock()
-        return status
+    async def get_or_create_user_status(self, user_id: str, source_message: types.Message) -> types.Message | None:
+        """Get or create a status message for user queue tracking."""
+        async with self._queue_lock:
+            existing = self._user_status.get(user_id)
+            if existing is not None:
+                return existing
+
+            keyboard = build_queue_keyboard([])
+            result = await source_message.reply_text(
+                text="📋 Preparing your queue..." + status_footer(),
+                reply_markup=keyboard,
+            )
+            if result is None or isinstance(result, types.Error):
+                LOGGER.warning(
+                    "Could not create status message for user %s: %s", user_id, result
+                )
+                return None
+
+            self._user_status[user_id] = result
+            self._user_status_locks[user_id] = asyncio.Lock()
+            return result
 
     async def _update_user_status(self, user_id: str, progress_block: str = "") -> None:
-        status_msg = self._user_status.get(user_id)
-        if status_msg is None:
+        async with self._queue_lock:
+            status_msg = self._user_status.get(user_id)
+            lock = self._user_status_locks.get(user_id)
+        
+        if status_msg is None or lock is None:
             return
-        lock = self._user_status_locks.get(user_id)
-        if lock is None:
-            return
+
         async with lock:
             text = self._render_user_status(user_id, progress_block)
-            await safe_edit_text(status_msg, text)
+            
+            # Generate keyboard for current jobs
+            job_ids = [j.id for j in self._active_jobs.values() if j.owner_id == user_id]
+            job_ids.extend(j.id for j in list(self._queue._queue) if j.owner_id == user_id)
+            keyboard = build_queue_keyboard(job_ids)
+            
+            await safe_edit_text(status_msg, text, reply_markup=keyboard)
 
     def _render_user_status(self, user_id: str, progress_block: str = "") -> str:
         active = [j for j in self._active_jobs.values() if j.owner_id == user_id]
@@ -355,6 +458,7 @@ class EncodeQueue:
             encoded_path: Path | None = None
             thumbnail_path: Path | None = None
             downloaded_path: Path | None = None
+            failed: bool = False
             try:
                 # ── Download phase ──
                 job.state = "downloading"
@@ -380,6 +484,9 @@ class EncodeQueue:
                 job.source_path = downloaded_path
 
                 # ── Encode phase ──
+                if job.cancel_event.is_set():
+                    raise asyncio.CancelledError("Job cancelled before encoding")
+                
                 job.state = "encoding"
                 await self._update_user_status(job.owner_id)
                 required_space = int(downloaded_path.stat().st_size * DISK_HEADROOM_MULTIPLIER)
@@ -417,23 +524,35 @@ class EncodeQueue:
 
                 if job.send_as_document:
                     await upload_document(
-                        job.message, encoded_path, progress_callback=_up_callback,
+                        job.message,
+                        encoded_path,
+                        progress_callback=_up_callback,
                     )
                 else:
                     await upload_video(
-                        job.message, encoded_path, progress_callback=_up_callback,
-                        cancel_event=job.cancel_event, thumbnail=thumbnail_path,
-                        duration=int(metadata.duration), width=metadata.width,
+                        job.message,
+                        encoded_path,
+                        progress_callback=_up_callback,
+                        cancel_event=job.cancel_event,
+                        thumbnail=thumbnail_path,
+                        duration=int(metadata.duration),
+                        width=metadata.width,
                         height=metadata.height,
-                        caption=f"Encoded with {job.profile.name}: {job.profile.codec.upper()} {job.profile.resolution}p CRF {job.profile.crf}.",
+                        caption=(
+                            f"Encoded with {job.profile.name}: "
+                            f"{job.profile.codec.upper()} {job.profile.resolution}p "
+                            f"CRF {job.profile.crf}."
+                        ),
                     )
 
                 # Done notification
                 try:
                     await job.message.reply_text(
-                        f"✅ Done: {job.filename}\n"
-                        f"Job #{job.id} | {job.profile.label}"
-                        f"{status_footer()}",
+                        text=(
+                            f"✅ Done: {job.filename}\n"
+                            f"Job #{job.id} | {job.profile.label}"
+                            f"{status_footer()}"
+                        ),
                     )
                 except Exception:
                     pass
@@ -444,9 +563,15 @@ class EncodeQueue:
                     raise
             except Exception as exc:
                 LOGGER.exception("Queued job failed")
-                await self._update_user_status(
-                    job.owner_id, f"❌ {friendly_error(exc)}",
-                )
+                failed = True
+                error_msg = friendly_error(exc)
+                # Reply the failure directly to the user's message so it is not
+                # overwritten by the subsequent status re-render.
+                try:
+                    await job.message.reply_text(text=f"❌ {error_msg}{status_footer()}")
+                except Exception:
+                    pass
+                await self._update_user_status(job.owner_id, f"❌ {error_msg}")
             finally:
                 if downloaded_path:
                     cleanup_file(downloaded_path)
@@ -459,7 +584,8 @@ class EncodeQueue:
                 self.release_user(job.owner_id)
                 self._queue.task_done()
                 self._save_journal()
-                await self._update_user_status(job.owner_id)
+                if not failed:
+                    await self._update_user_status(job.owner_id)
                 remaining = [j for j in self._active_jobs.values() if j.owner_id == job.owner_id] + \
                             [j for j in list(self._queue._queue) if j.owner_id == job.owner_id]
                 if not remaining:
@@ -467,9 +593,13 @@ class EncodeQueue:
                     self._user_status_locks.pop(job.owner_id, None)
                     if status_msg is not None:
                         try:
-                            await safe_edit_text(status_msg, "✅ All jobs complete!" + status_footer())
+                            await safe_edit_text(
+                                status_msg,
+                                "✅ All jobs complete!" + status_footer(),
+                                reply_markup=build_queue_keyboard([]),
+                            )
                             _schedule_delete(status_msg)
-                        except Exception:
+                        except Exception:  # noqa: BLE001
                             pass
 
 
@@ -484,19 +614,26 @@ def friendly_error(exc: Exception) -> str:
     if any(marker in detail for marker in ("stream map", "matches no streams", "no video", "no usable video")):
         return "This file does not contain a usable video stream."
     if any(marker in detail for marker in ("invalid data", "moov atom", "decoder", "unsupported codec", "unknown decoder")):
-        return "This video codec or container is not supported by FFmpeg on this server."
+        return "Video codec not supported. Try converting to MP4 (H.264) first."
     if any(marker in detail for marker in ("file too large", "file_too_big", "request_entity_too_large")):
-        return "This file is too large for Telegram or the configured server limits."
+        return "File too large for Telegram. Try the 'tiny' profile for smaller output."
+    if "empty" in detail or "not created" in detail:
+        return "Encoding produced no output. The source video may be corrupted or unsupported."
+    if "stalled" in detail:
+        return "Encoding stalled and was aborted. Try a faster profile or a smaller video."
     return "Encoding or transfer failed. Check that the video is valid and try again."
 
 
-def _schedule_delete(msg: Message) -> None:
-    async def _del():
+def _schedule_delete(msg: types.Message) -> None:
+    """Schedule a status message for deletion after AUTO_DELETE_STATUS_DELAY seconds."""
+    async def _del() -> None:
         await asyncio.sleep(AUTO_DELETE_STATUS_DELAY)
         try:
-            await msg.delete()
-        except Exception:
-            pass
+            result = await msg.delete(revoke=True)
+            if isinstance(result, types.Error):
+                LOGGER.debug("Auto-delete failed: %s", getattr(result, "message", result))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Auto-delete exception: %s", exc)
     asyncio.create_task(_del())
 
 

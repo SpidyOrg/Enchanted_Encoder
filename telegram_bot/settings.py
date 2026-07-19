@@ -93,22 +93,23 @@ class EncodeSettings:
         return True
 
     def describe(self) -> str:
+        """Generate human-readable settings description.
+        
+        Returns:
+            Formatted settings string for display
+        """
         choices = "\n".join(
             f"{'✅' if key == self.profile_key else '▫️'} {key}: {profile.label}"
             for key, profile in PROFILES.items()
         )
-        doc_status = "on" if self.send_as_document else "off"
-        footer = (
-            "Use /settings <profile> to change encode profile.\n"
-            "Profiles: balanced, speed, compact, quality, tiny, hevc, av1.\n"
-            "Use /settings document on|off to toggle send as file."
-        )
+        doc_status = "ON" if self.send_as_document else "OFF"
         return (
-            "🎛 Encode settings\n"
-            f"Current: {self.profile.label}\n"
-            f"Send as document: {doc_status}\n\n"
-            f"{choices}\n\n"
-            f"{footer}"
+            f"⚙️ <b>Encode Settings</b>\n\n"
+            f"📊 <b>Current Profile:</b> {self.profile.name}\n"
+            f"   {self.profile.resolution}p • CRF {self.profile.crf} • {CODEC_LABELS.get(self.profile.codec, self.profile.codec.upper())}\n\n"
+            f"📄 <b>Send as Document:</b> {doc_status}\n\n"
+            f"📋 <b>Available Profiles:</b>\n{choices}\n\n"
+            f"💡 Use the buttons below to change settings."
         )
 
 
@@ -146,39 +147,75 @@ class SettingsStore:
         return self.get(user_id)
 
     def _load(self) -> None:
-        try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-            profiles = payload.get("profiles", {})
-            if isinstance(profiles, dict):
-                self._profiles = {
-                    str(uid): profile
-                    for uid, profile in profiles.items()
-                    if profile in PROFILES
-                }
-            doc_flags_raw = payload.get("document", {})
-            if isinstance(doc_flags_raw, dict):
-                self._doc_flags = {
-                    str(uid): bool(val)
-                    for uid, val in doc_flags_raw.items()
-                }
-        except FileNotFoundError:
+        if self._load_from(self._path):
             return
-        except (OSError, json.JSONDecodeError, AttributeError):
-            logging.getLogger(__name__).warning("Ignoring unreadable settings file: %s", self._path)
+        # Primary settings unreadable/corrupt — attempt to restore from backup
+        backup_path = self._path.with_suffix(f"{self._path.suffix}.bak")
+        if backup_path.exists() and self._load_from(backup_path):
+            logging.getLogger(__name__).warning(
+                "Restored settings from backup: %s", backup_path
+            )
+
+    def _load_from(self, path: Path) -> bool:
+        """Load and validate settings from a path. Returns True on success."""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, json.JSONDecodeError):
+            logging.getLogger(__name__).warning("Ignoring unreadable settings file: %s", path)
+            return False
+
+        if not isinstance(payload, dict):
+            return False
+
+        profiles = payload.get("profiles", {})
+        if isinstance(profiles, dict):
+            self._profiles = {
+                str(uid): profile
+                for uid, profile in profiles.items()
+                if profile in PROFILES
+            }
+        doc_flags_raw = payload.get("document", {})
+        if isinstance(doc_flags_raw, dict):
+            self._doc_flags = {
+                str(uid): bool(val)
+                for uid, val in doc_flags_raw.items()
+            }
+        return True
 
     def _save(self) -> None:
+        import tempfile
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
         payload = json.dumps({
             "profiles": self._profiles,
             "document": self._doc_flags,
         }, indent=2, sort_keys=True) + "\n"
+        
+        # Create a backup of the previous settings just in case
+        backup_path = self._path.with_suffix(f"{self._path.suffix}.bak")
         try:
-            temporary.write_text(payload, encoding="utf-8")
-            os.replace(temporary, self._path)
+            if self._path.exists():
+                import shutil
+                shutil.copy2(self._path, backup_path)
+        except OSError:
+            pass
+
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=self._path.parent, delete=False, encoding="utf-8") as temp_file:
+                temp_file.write(payload)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = Path(temp_file.name)
+            os.replace(temp_path, self._path)
+            try:
+                os.chmod(self._path, 0o600)
+            except OSError:
+                pass
         except OSError as exc:
             try:
-                temporary.unlink(missing_ok=True)
+                if 'temp_path' in locals() and temp_path.exists():
+                    temp_path.unlink()
             except OSError:
                 pass
             raise RuntimeError("Could not save settings") from exc
