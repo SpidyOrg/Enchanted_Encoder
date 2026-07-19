@@ -9,7 +9,7 @@ from pathlib import Path
 
 from telegram_bot.runtime import status_footer
 from telegram_bot.settings import EncodeProfile
-from telegram_bot.transfer import BAR_WIDTH, ProgressMessage
+from telegram_bot.transfer import BAR_WIDTH, ProgressMessage, safe_edit_text
 
 
 async def encode_h264_720p(
@@ -21,7 +21,8 @@ async def encode_h264_720p(
     job_id: int | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / f"{source.stem}.encoded.{profile.key}.mp4"
+    job_suffix = f".job-{job_id}" if job_id is not None else ""
+    target = output_dir / f"{source.stem}{job_suffix}.encoded.{profile.key}.mp4"
     metadata = await probe_video_metadata(source)
     duration = metadata.duration
 
@@ -88,9 +89,10 @@ async def encode_h264_720p(
                 ffmpeg_speed = _speed_to_float(value)
 
             now = time.monotonic()
-            if now - last_edit_at >= 1.5:
+            if now - last_edit_at >= 5:
                 last_edit_at = now
-                await progress.message.edit_text(
+                await safe_edit_text(
+                    progress.message,
                     render_encode_progress(
                         out_time,
                         duration,
@@ -121,7 +123,8 @@ async def encode_h264_720p(
             target.unlink()
         raise RuntimeError("Encoded output was not created")
 
-    await progress.message.edit_text(
+    await safe_edit_text(
+        progress.message,
         render_encode_progress(
             duration,
             duration,

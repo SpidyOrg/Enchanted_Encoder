@@ -17,6 +17,7 @@ from telegram_bot.transfer import (
     download_media,
     extract_media_file,
     is_video_message,
+    safe_edit_text,
 )
 
 
@@ -110,6 +111,35 @@ def register_handlers(client: Client, config: BotConfig) -> None:
     @client.on_message()
     async def handle_message(_: Client, message: types.Message) -> None:
         text = _message_text(message)
+        if text.startswith("/"):
+            command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+            if command == "/start":
+                await message.reply_text("✅ Bot is running. Send a video to encode it." + status_footer())
+            elif command == "/help":
+                await message.reply_text(HELP_TEXT + status_footer())
+            elif command == "/ping":
+                await message.reply_text("🏓 pong" + status_footer())
+            elif command == "/id":
+                await message.reply_text(f"chat_id: {message.chat_id}\nfrom_id: {_sender_id(message)}" + status_footer())
+            elif command == "/settings":
+                parts = text.split(maxsplit=1)
+                user_id = _sender_id(message)
+                if len(parts) == 1:
+                    await message.reply_text(_settings_store().get(user_id).describe() + status_footer())
+                else:
+                    settings = _settings_store().set_profile(user_id, parts[1])
+                    if settings is None:
+                        await message.reply_text("❌ Unknown profile.\n\n" + _settings_store().get(user_id).describe() + status_footer())
+                    else:
+                        await message.reply_text(f"✅ Your default profile is now {settings.profile.label}" + status_footer())
+            elif command in {"/queue", "/status"}:
+                await message.reply_text(_encode_queue().summary())
+            elif command == "/cancel":
+                await handle_cancel(message, text)
+            else:
+                await message.reply_text("❌ Unknown command. Send /help." + status_footer())
+            return
+
         media_file = extract_media_file(message)
         if media_file is not None:
             if not is_video_message(message):
@@ -117,35 +147,7 @@ def register_handlers(client: Client, config: BotConfig) -> None:
                 return
             await handle_media(client, message, media_file, config)
             return
-        if not text:
-            return
-        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-        if command == "/start":
-            await message.reply_text("✅ Bot is running. Send a video to encode it." + status_footer())
-        elif command == "/help":
-            await message.reply_text(HELP_TEXT + status_footer())
-        elif command == "/ping":
-            await message.reply_text("🏓 pong" + status_footer())
-        elif command == "/id":
-            await message.reply_text(f"chat_id: {message.chat_id}\nfrom_id: {_sender_id(message)}" + status_footer())
-        elif command == "/settings":
-            parts = text.split(maxsplit=1)
-            user_id = _sender_id(message)
-            if len(parts) == 1:
-                await message.reply_text(_settings_store().get(user_id).describe() + status_footer())
-            else:
-                settings = _settings_store().set_profile(user_id, parts[1])
-                if settings is None:
-                    await message.reply_text("❌ Unknown profile.\n\n" + _settings_store().get(user_id).describe() + status_footer())
-                else:
-                    await message.reply_text(f"✅ Your default profile is now {settings.profile.label}" + status_footer())
-        elif command in {"/queue", "/status"}:
-            await message.reply_text(_encode_queue().summary())
-        elif command == "/cancel":
-            await handle_cancel(message, text)
-        elif text.startswith("/"):
-            await message.reply_text("❌ Unknown command. Send /help." + status_footer())
-        elif getattr(message, "is_private", False):
+        if text and getattr(message, "is_private", False):
             await message.reply_text(text)
 
 
@@ -178,13 +180,13 @@ async def handle_media(client: Client, message: types.Message, media_file: types
         if await queue.enqueue(job) is None:
             cleanup_file(downloaded_path)
             queue.release_user(owner_id)
-            await status.edit_text("🚦 Queue is full. Try again later." + status_footer())
+            await safe_edit_text(status, "🚦 Queue is full. Try again later." + status_footer())
     except Exception as exc:
         logging.getLogger(__name__).exception("Media transfer failed")
         if downloaded_path is not None:
             cleanup_file(downloaded_path)
         queue.release_user(owner_id)
-        await status.edit_text("❌ " + friendly_error(exc) + status_footer())
+        await safe_edit_text(status, "❌ " + friendly_error(exc) + status_footer())
 
 
 async def handle_cancel(message: types.Message, text: str) -> None:
@@ -218,6 +220,11 @@ def main() -> None:
     if removed:
         logging.getLogger(__name__).info("Removed %s stale runtime files", removed)
     SETTINGS_STORE = SettingsStore(config.settings_path)
-    ENCODE_QUEUE = EncodeQueue(UPLOAD_PROGRESS, config.output_dir, max_jobs_per_user=config.max_jobs_per_user)
+    ENCODE_QUEUE = EncodeQueue(
+        UPLOAD_PROGRESS,
+        config.output_dir,
+        max_jobs_per_user=config.max_jobs_per_user,
+        max_concurrent_encoders=config.max_concurrent_encoders,
+    )
     logging.getLogger(__name__).info("Starting Telegram bot")
     create_client(config).run()

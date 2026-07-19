@@ -8,7 +8,7 @@ It is built around `pytdbot`, `tdjson`, and local FFmpeg binaries. The bot is de
 
 - Handles Telegram video, animation, video note, and `video/*` document messages.
 - Downloads media with progress updates.
-- Queues encode jobs and runs a single encode worker.
+- Queues encode jobs and runs two concurrent encode workers by default.
 - Re-encodes to H.264/AAC MP4 with selectable profiles.
 - Uploads the encoded video with thumbnail, streaming support, and progress updates.
 - Shows queue, CPU, RAM, disk, network, and uptime status in bot messages.
@@ -101,7 +101,8 @@ The bot reads `.env` first and then environment variables. Existing environment 
 | `PYTDBOT_TDJSON_LIB` | no | none | Explicit path to a `tdjson` shared library. |
 | `BOT_SETTINGS_PATH` | no | `bot_settings.json` | JSON file storing each user's selected encode profile. |
 | `BOT_OUTPUT_DIR` | no | `encoded` | Directory for encoded outputs and generated thumbnails. |
-| `MAX_JOBS_PER_USER` | no | `1` | Maximum active, queued, or downloading jobs per user. Minimum is `1`. |
+| `MAX_JOBS_PER_USER` | no | `3` | Maximum active, queued, or downloading jobs per user. Minimum is `1`. |
+| `MAX_CONCURRENT_ENCODERS` | no | `2` | Number of concurrent FFmpeg workers. Allowed range: `1` to `3`. |
 | `STALE_FILE_HOURS` | no | `24` | Age threshold for startup cleanup. Minimum is `1`. |
 
 Keep credentials in `.env` or deployment secrets. Do not hard-code Telegram secrets in source files.
@@ -163,11 +164,11 @@ The workflow for a video is:
 3. Check that free disk space is at least `2.5x` the source file size.
 4. Download the Telegram media through TDLib.
 5. Add the downloaded file to the encode queue.
-6. Encode one queued job at a time.
+6. Encode up to `MAX_CONCURRENT_ENCODERS` queued jobs at a time.
 7. Upload the encoded MP4 back to the original chat.
 8. Delete runtime files after the job finishes, fails, or is cancelled.
 
-The queue can hold up to 20 waiting jobs. `MAX_JOBS_PER_USER` controls how many jobs a single user can have across downloading, queued, and active states.
+The queue can hold up to 20 waiting jobs. `MAX_JOBS_PER_USER` controls how many jobs a single user can have across downloading, queued, and active states. `MAX_CONCURRENT_ENCODERS=2` is the default; use `3` only when CPU, RAM, and disk throughput remain healthy under load. Each job receives a unique output path and reserves its disk budget before encoding.
 
 Cancellation is cooperative:
 
