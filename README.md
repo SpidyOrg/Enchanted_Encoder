@@ -1,217 +1,121 @@
-# Pytdbot Telegram Video Encoder
+# Enchanted Encoder
 
-This codebase is a small Telegram bot that receives video messages, downloads them through TDLib, re-encodes them with FFmpeg, and uploads the encoded MP4 back to the chat.
+A self-hosted Telegram bot that re-encodes videos on the fly using FFmpeg. Drop a video in chat — the bot downloads it, compresses or converts it with your chosen profile, and sends the result back. Powered by [pytdbot](https://github.com/pytdbot/client) (MTProto) for reliable streaming uploads and real-time progress.
 
-It is built around `pytdbot`, `tdjson`, and local FFmpeg binaries. The bot is designed for simple VPS-style deployments where only one FFmpeg encode should run at a time to avoid CPU and memory contention.
+---
 
 ## Features
 
-- Handles Telegram video, animation, video note, and `video/*` document messages.
-- Downloads media with progress updates.
-- Queues encode jobs and runs two concurrent encode workers by default.
-- Re-encodes to H.264/AAC MP4 with selectable profiles.
-- Uploads the encoded video with thumbnail, streaming support, and progress updates.
-- Shows queue, CPU, RAM, disk, network, and uptime status in bot messages.
-- Lets each user persist a default encode profile.
-- Supports cancellation by job id or by replying to the original task.
-- Cleans temporary downloaded, encoded, thumbnail, and stale incomplete files.
+### Multi-Codec Encoding
+- **H.264** — best compatibility, 5 presets from `tiny` to `quality`
+- **HEVC** (`libx265`) — ~50% smaller files at similar quality
+- **AV1** (`libsvtav1`) — state-of-the-art compression, up to 30% smaller than HEVC
 
-## Repository layout
+### 7 Built-In Profiles
+| Profile | Codec  | Resolution | CRF | Preset          | Bitrate |
+|---------|--------|------------|-----|-----------------|---------|
+| Tiny    | H.264  | 360p       | 28  | superfast       | 64k     |
+| Compact | H.264  | 480p       | 26  | veryfast        | 96k     |
+| Speed   | H.264  | 540p       | 24  | superfast       | 96k     |
+| Balanced| H.264  | 720p       | 22  | veryfast        | 128k    |
+| Quality | H.264  | 720p       | 20  | faster          | 160k    |
+| HEVC    | H.265  | 720p       | 26  | medium          | 96k     |
+| AV1     | AV1    | 720p       | 30  | 10 (preset)     | 96k     |
 
-```text
-.
-├── README.md
-├── requirements.txt
-└── telegram_bot/
-    ├── __main__.py        # python -m telegram_bot entrypoint
-    ├── bot.py             # Telegram client setup, commands, and message routing
-    ├── config.py          # environment and .env configuration loading
-    ├── encoder.py         # ffprobe/ffmpeg encoding and thumbnail generation
-    ├── queue_manager.py   # encode queue, cancellation, cleanup, upload handoff
-    ├── runtime.py         # resource status, size/time formatting, stale cleanup
-    ├── settings.py        # encode profiles and per-user settings persistence
-    └── transfer.py        # Telegram download/upload progress helpers
-```
+### Live Progress & System Telemetry
+Every status update shows real-time encode/upload progress bars, speed, ETA, plus a footer with:
+- CPU usage & load
+- RAM consumption
+- Disk free space
+- Network transfer totals
+- Bot uptime
 
-## Requirements
+All status messages are per-user — one consolidated message tracks your downloads, encodes, and uploads, then auto-deletes 30 seconds after all jobs finish.
 
-- Python 3.10+
-- FFmpeg and FFprobe available on `PATH`
-- Telegram API credentials from <https://my.telegram.org/apps>
-- Telegram bot token from BotFather
+### Intelligent Concurrency
+- Separate download and encode job limits per user
+- Global queue capacity with fair user slot allocation
+- Configurable number of parallel encoders (default: 2)
+- Thread pinning: `ceil(CPU cores / max encoders)` threads per FFmpeg process
+- Stall detection (10 min timeout) on both download and upload
 
-Python dependencies are pinned in `requirements.txt`:
+### Queue Persistence
+- Journal file (`queue_journal.json`) saves queued job metadata
+- On restart, orphaned jobs are detected, logged, and cleaned up
+- Settings are stored per-user in atomic JSON writes
 
-```text
-pytdbot==0.9.8.post1
-tdjson==1.8.56.post3
-```
+### Cancel & Control
+- `/cancel <job_id>` or reply to source video to cancel
+- Only the job owner can cancel their tasks
+- `/check` verifies encoder availability (libx264, libx265, libsvtav1)
+- `/settings <profile>` to switch default profile
+- `/settings document on|off` to send results as file instead of streamable video
 
-`tdjson` is installed only on supported 64-bit x86 or ARM platforms according to the environment marker in `requirements.txt`.
+### Smart Upload
+- Videos are uploaded as streamable MP4 with thumbnail, caption, and metadata (duration, dimensions)
+- Optional document mode for non-streamable delivery
+- Rate-limit handling with automatic retry (up to 3 attempts)
+- Live upload speed tracking via TDLib file updates
 
-## Setup
+### Startup Housekeeping
+- Stale file cleanup on boot (clears partial downloads and old encoded outputs older than `STALE_FILE_HOURS`)
 
-Create and activate a virtual environment:
+---
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
+## Commands
 
-Install Python dependencies:
+| Command | Description |
+|---------|-------------|
+| `/start` | Bot welcome |
+| `/help` | Command list |
+| `/ping` | Reachability check |
+| `/id` | Show chat & sender IDs |
+| `/settings` | Show current profile & all available profiles |
+| `/settings <name>` | Set default profile (e.g., `/settings hevc`) |
+| `/settings document on\|off` | Toggle sending as file |
+| `/queue`, `/status` | Your active & queued jobs |
+| `/cancel <id>` or reply to source | Cancel a job |
+| `/check` | List installed FFmpeg encoders |
+
+---
+
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
-```
-
-Check FFmpeg:
-
-```bash
-ffmpeg -version
-ffprobe -version
-```
-
-Create a local `.env` file in the project root:
-
-```env
-TELEGRAM_API_ID=123456
-TELEGRAM_API_HASH=your_api_hash
-TELEGRAM_BOT_TOKEN=123456:your_bot_token
-```
-
-Then start the bot:
-
-```bash
+cp .env.example .env
+# edit .env with your Telegram API credentials
 python -m telegram_bot
 ```
 
-## Configuration
+Required environment variables:
+- `TELEGRAM_API_ID` — Telegram API ID (from my.telegram.org)
+- `TELEGRAM_API_HASH` — Telegram API hash
+- `TELEGRAM_BOT_TOKEN` — Bot token from @BotFather
 
-The bot reads `.env` first and then environment variables. Existing environment variables take precedence over `.env` values.
+Optional environment variables:
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `TELEGRAM_API_ID` or `TELEGRAM_API` | yes | none | Telegram application API id. Must be an integer. |
-| `TELEGRAM_API_HASH` or `TELEGRAM_HASH` | yes | none | Telegram application API hash. |
-| `TELEGRAM_BOT_TOKEN` or `BOT_TOKEN` | yes | none | Bot token from BotFather. |
-| `PYTDBOT_FILES_DIR` | no | `.tdlib` | TDLib files and download directory. |
-| `PYTDBOT_DB_KEY` | no | `pytdbot-local-db-key` | TDLib local database encryption key. |
-| `PYTDBOT_TD_VERBOSITY` | no | `2` | TDLib logging verbosity. |
-| `PYTDBOT_TD_LOG` | no | `tdlib.log` | TDLib log file path. Set empty to disable file logging. |
-| `PYTDBOT_TDJSON_LIB` | no | none | Explicit path to a `tdjson` shared library. |
-| `BOT_SETTINGS_PATH` | no | `bot_settings.json` | JSON file storing each user's selected encode profile. |
-| `BOT_OUTPUT_DIR` | no | `encoded` | Directory for encoded outputs and generated thumbnails. |
-| `MAX_JOBS_PER_USER` | no | `3` | Maximum active, queued, or downloading jobs per user. Minimum is `1`. |
-| `MAX_CONCURRENT_ENCODERS` | no | `2` | Number of concurrent FFmpeg workers. Allowed range: `1` to `3`. |
-| `STALE_FILE_HOURS` | no | `24` | Age threshold for startup cleanup. Minimum is `1`. |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_JOBS_PER_USER` | 3 | Max queued + active jobs per user |
+| `MAX_CONCURRENT_ENCODERS` | 2 | Number of parallel FFmpeg processes |
+| `BOT_OUTPUT_DIR` | encoded | Output directory for encoded files |
+| `BOT_SETTINGS_PATH` | bot_settings.json | User settings file path |
+| `STALE_FILE_HOURS` | 24 | Auto-cleanup age for temp files |
+| `PYTDBOT_FILES_DIR` | .tdlib | TDLib file download directory |
+| `PYTDBOT_TD_VERBOSITY` | 2 | TDLib log verbosity (0-5) |
 
-Keep credentials in `.env` or deployment secrets. Do not hard-code Telegram secrets in source files.
+---
 
-## Bot commands
+## Requirements
 
-| Command | Description |
-| --- | --- |
-| `/start` | Confirm the bot is running. |
-| `/help` | Show command help. |
-| `/ping` | Check responsiveness. |
-| `/id` | Show current chat id and sender id. |
-| `/settings` | Show available encode profiles and the current user's selected default. |
-| `/settings <profile>` | Persist the current user's default profile. |
-| `/queue` | Show queue and active job status. |
-| `/status` | Alias for `/queue`. |
-| `/cancel <job_id>` | Cancel the user's queued or active job by id. |
-| `/cancel` as a reply | Cancel the task associated with the replied video message. |
+- **Python 3.12+**
+- **FFmpeg** with `libx264`, `libx265`, and `libsvtav1` (if using those codecs)
+- **pytdbot** (Telegram MTProto client)
+- **tdjson** (TDLib native bindings)
 
-Unknown commands return a help hint. In private chats, non-command text is echoed back.
+---
 
-## Encoding profiles
+## License
 
-The default profile is `balanced`.
-
-| Profile | Output | Video settings | Audio |
-| --- | --- | --- | --- |
-| `balanced` | 720p | H.264, CRF 22, `veryfast` | AAC 128k |
-| `speed` | 540p | H.264, CRF 24, `superfast` | AAC 96k |
-| `compact` | 480p | H.264, CRF 26, `veryfast` | AAC 96k |
-| `quality` | 720p | H.264, CRF 20, `faster` | AAC 160k |
-| `tiny` | 360p | H.264, CRF 28, `superfast` | AAC 64k |
-
-The FFmpeg command shape is:
-
-```bash
-ffmpeg \
-  -i <source> \
-  -map 0:v:0 -map 0:a? \
-  -vf scale=-2:<profile-resolution> \
-  -c:v libx264 \
-  -preset <profile-x264-preset> \
-  -threads 0 \
-  -crf <profile-crf> \
-  -c:a aac \
-  -b:a <profile-audio-bitrate> \
-  -movflags +faststart \
-  <output>
-```
-
-The bot uses `ffprobe` to read duration and dimensions before upload, and it generates a thumbnail from roughly one quarter into the encoded video when possible.
-
-## Queue and runtime behavior
-
-The workflow for a video is:
-
-1. Validate that the message contains video media.
-2. Reserve a per-user job slot.
-3. Check that free disk space is at least `2.5x` the source file size.
-4. Download the Telegram media through TDLib.
-5. Add the downloaded file to the encode queue.
-6. Encode up to `MAX_CONCURRENT_ENCODERS` queued jobs at a time.
-7. Upload the encoded MP4 back to the original chat.
-8. Delete runtime files after the job finishes, fails, or is cancelled.
-
-The queue can hold up to 20 waiting jobs. `MAX_JOBS_PER_USER` controls how many jobs a single user can have across downloading, queued, and active states. `MAX_CONCURRENT_ENCODERS=2` is the default; use `3` only when CPU, RAM, and disk throughput remain healthy under load. Each job receives a unique output path and reserves its disk budget before encoding.
-
-Cancellation is cooperative:
-
-- queued jobs are removed from the queue and their downloaded source file is deleted;
-- active encode jobs signal FFmpeg to terminate, then remove partial output;
-- active upload jobs request task cancellation, but Telegram may finish an already-started transfer.
-
-## Runtime files
-
-Common generated files and directories:
-
-| Path | Purpose |
-| --- | --- |
-| `.tdlib/` | TDLib database and downloaded Telegram files by default. |
-| `encoded/` | Temporary encoded MP4 files and thumbnails by default. |
-| `bot_settings.json` | Per-user selected encode profiles. |
-| `tdlib.log` | TDLib log file by default. |
-
-At startup, the bot removes stale generated files from `BOT_OUTPUT_DIR` and old incomplete TDLib artifacts with suffixes like `.part`, `.partial`, and `.tmp` under `PYTDBOT_FILES_DIR`.
-
-After each job, the source download, encoded MP4, and generated thumbnail are removed. User profile settings are persisted in `bot_settings.json`.
-
-## Development notes
-
-Run the bot locally with:
-
-```bash
-python -m telegram_bot
-```
-
-There is currently no dedicated test suite in this directory. For a quick syntax check:
-
-```bash
-python -m compileall telegram_bot
-```
-
-The code uses asynchronous handlers from `pytdbot`, `asyncio` subprocesses for FFmpeg/FFprobe, and direct Telegram message edits for progress reporting.
-
-## Troubleshooting
-
-- `Missing required environment variable`: set the required Telegram values in `.env` or your shell.
-- `TELEGRAM_API_ID/TELEGRAM_API must be an integer`: use the numeric API id from Telegram, not the hash.
-- FFmpeg or FFprobe errors: confirm both binaries are installed and available on `PATH`.
-- Disk space errors: free server storage, reduce input size, or choose a smaller profile such as `compact` or `tiny`.
-- Unsupported video errors: verify the input has a usable video stream and that the server FFmpeg build supports the codec/container.
-- Upload size errors: Telegram or server limits may reject the encoded output; choose a smaller profile.
+MIT
